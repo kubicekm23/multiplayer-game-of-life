@@ -25,6 +25,6 @@ RUN npm ci --only=production
 COPY --from=builder /app/dist ./dist
 
 # Expose the port your app runs on
-EXPOSE 3000
+EXPOSE 3050
 
 CMD ["node", "dist/index.js"]
