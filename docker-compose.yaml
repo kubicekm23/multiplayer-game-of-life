@@ -11,6 +11,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    ports:
+      - "3050:3050"
 
   db:
     # Using the newest stable version (Postgres 18)
