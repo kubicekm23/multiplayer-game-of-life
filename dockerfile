@@ -14,17 +14,18 @@ RUN npm run build
 FROM node:20-alpine AS runner
 WORKDIR /app
 
-# Set environment to production
 ENV NODE_ENV=production
 
-# Only install production dependencies
 COPY package*.json ./
 RUN npm ci --only=production
 
-# Copy compiled code from builder
+# 1. Copy the compiled JS
 COPY --from=builder /app/dist ./dist
 
-# Expose the port your app runs on
-EXPOSE 3050
+# 2. ADD THIS: Copy your views and public folders
+COPY views ./views
+# COPY public ./public (Uncomment if you have a public folder)
+
+EXPOSE 3000
 
 CMD ["node", "dist/index.js"]
