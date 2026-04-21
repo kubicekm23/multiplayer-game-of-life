@@ -7,7 +7,7 @@ services:
     environment:
       # Coolify will provide these variables
       - DATABASE_URL=postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}
-      - PORT=3000
+      - PORT=3050
     depends_on:
       db:
         condition: service_healthy
