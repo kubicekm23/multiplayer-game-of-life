@@ -1,1 +1,99 @@
-<a>Log In</a>
+<main class="app-shell">
+  <section class="topbar">
+    <div>
+      <p class="eyebrow">Multiplayer cellular strategy</p>
+      <h1>Game of War</h1>
+    </div>
+    <form id="new-game-form" class="lobby">
+      <label>
+        Players
+        <select name="playerCount">
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4" selected>4</option>
+        </select>
+      </label>
+      <label>
+        Mode
+        <select name="teamMode">
+          <option value="ffa" selected>FFA</option>
+          <option value="duo">2v2</option>
+        </select>
+      </label>
+      <label>
+        Arena
+        <select name="arena">
+          <option value="garden" selected>Garden</option>
+          <option value="maze">Maze</option>
+          <option value="crucible">Crucible</option>
+        </select>
+      </label>
+      <label>
+        Turn
+        <input name="planningSeconds" type="number" min="8" max="90" value="25">
+      </label>
+      <button type="submit">New arena</button>
+    </form>
+  </section>
+
+  <section class="game-layout">
+    <aside class="panel">
+      <div class="phase-card">
+        <span id="phase-label">Planning</span>
+        <strong id="timer">--</strong>
+        <button id="resolve-now" type="button">Resolve turn</button>
+      </div>
+
+      <label class="field">
+        Active player
+        <select id="player-select"></select>
+      </label>
+
+      <div class="budget-card">
+        <span>Placement budget</span>
+        <strong id="budget-count">--</strong>
+        <div class="budget-row">
+          <small id="budget-base">Base --</small>
+          <small id="budget-energy">Biomass --</small>
+        </div>
+      </div>
+
+      <div class="tool-grid" role="group" aria-label="Cell tools">
+        <button class="tool active" data-tool="place" data-cell="seed" type="button">Seed</button>
+        <button class="tool" data-tool="place" data-cell="wall" type="button">Wall</button>
+        <button class="tool" data-tool="place" data-cell="hunter" type="button">Hunter</button>
+        <button class="tool" data-tool="place" data-cell="spore" type="button">Spore</button>
+        <button class="tool danger" data-tool="remove" type="button">Remove</button>
+      </div>
+
+      <div class="unit-reference">
+        <h2>Cells</h2>
+        <dl>
+          <div><dt>Seed</dt><dd>Basic growth cell. Best for stable expansion.</dd></div>
+          <div><dt>Wall</dt><dd>Low attack, better survival. Fortify improves it.</dd></div>
+          <div><dt>Hunter</dt><dd>Counts as stronger pressure against nearby enemies.</dd></div>
+          <div><dt>Spore</dt><dd>Riskier spread cell. Fertile makes it easier to keep alive.</dd></div>
+        </dl>
+      </div>
+    </aside>
+
+    <section class="board-wrap">
+      <div id="board" class="board" aria-label="Arena grid"></div>
+    </section>
+
+    <aside class="panel right-panel">
+      <h2>Players</h2>
+      <div id="players" class="players"></div>
+      <h2>Combat log</h2>
+      <ol id="log" class="log"></ol>
+    </aside>
+  </section>
+
+  <div id="mutation-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="mutation-title">
+    <div class="modal-panel">
+      <h2 id="mutation-title">Choose mutation</h2>
+      <p>Your cells consumed a mutation pickup. Pick one upgrade for the rest of the match.</p>
+      <div id="mutation-options" class="mutation-options"></div>
+    </div>
+  </div>
+</main>
