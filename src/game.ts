@@ -1,9 +1,11 @@
+import { MUTATION_CATALOG } from './mutations';
+
 export type Phase = 'planning' | 'finished';
 export type TeamMode = 'ffa' | 'duo';
 export type ArenaId = 'garden' | 'maze' | 'crucible';
 export type CellType = 'seed' | 'wall' | 'hunter' | 'spore';
 export type PickupType = 'food' | 'mutation';
-export type MutationId = 'overgrowth' | 'fortify' | 'predator' | 'fertile';
+export type MutationId = (typeof MUTATION_CATALOG)[number]['id'];
 
 export interface Cell {
   ownerId: number | null;
@@ -17,9 +19,22 @@ export interface Player {
   color: string;
   controller: 'human' | 'bot';
   energy: number;
+  carryoverBudget: number;
+  budgetDebt: number;
+  tempBudget: number;
+  lastFoodRound: number;
+  rerolls: number;
   alive: boolean;
   mutations: MutationId[];
   pendingMutations: MutationId[];
+}
+
+export interface BoardMarker {
+  x: number;
+  y: number;
+  ownerId: number;
+  type?: CellType;
+  round: number;
 }
 
 export interface GameSettings {
@@ -50,18 +65,17 @@ export interface GameState {
   players: Player[];
   board: Array<Cell | null>;
   queuedActions: QueuedAction[];
+  deadCells: BoardMarker[];
+  husks: BoardMarker[];
   log: string[];
 }
 
 const colors = ['#32d583', '#60a5fa', '#f97316', '#e879f9'];
-const mutationPool: MutationId[] = ['overgrowth', 'fortify', 'predator', 'fertile'];
+const mutationPool: MutationId[] = MUTATION_CATALOG.map((mutation) => mutation.id);
 
-const mutationLabels: Record<MutationId, string> = {
-  overgrowth: 'Overgrowth: placement range +1',
-  fortify: 'Fortify: wall cells survive with one extra hostile pressure',
-  predator: 'Predator: hunters apply stronger attack pressure',
-  fertile: 'Fertile: spores can survive with one same-owner neighbor',
-};
+const mutationLabels = Object.fromEntries(
+  MUTATION_CATALOG.map((mutation) => [mutation.id, `${mutation.name}: ${mutation.summary}`]),
+) as Record<MutationId, string>;
 
 export function getMutationLabels(): Record<MutationId, string> {
   return mutationLabels;
@@ -94,6 +108,11 @@ export function createGame(overrides: Partial<GameSettings> = {}): GameState {
     color: colors[index],
     controller: index === 0 ? 'human' : 'bot',
     energy: 2,
+    carryoverBudget: 0,
+    budgetDebt: 0,
+    tempBudget: 0,
+    lastFoodRound: 1,
+    rerolls: 1,
     alive: true,
     mutations: [],
     pendingMutations: [],
@@ -108,6 +127,8 @@ export function createGame(overrides: Partial<GameSettings> = {}): GameState {
     players,
     board: Array(settings.width * settings.height).fill(null),
     queuedActions: [],
+    deadCells: [],
+    husks: [],
     log: [`Arena ${settings.arena} started.`],
   };
 
@@ -116,7 +137,7 @@ export function createGame(overrides: Partial<GameSettings> = {}): GameState {
   return state;
 }
 
-export function serializeGame(state: GameState): GameState & { mutationLabels: Record<MutationId, string> } {
+export function serializeGame(state: GameState): GameState & { mutationLabels: Record<MutationId, string>; mutationCatalog: typeof MUTATION_CATALOG } {
   tickGame(state);
   if (state.phase === 'planning') queueBotActions(state);
   return {
@@ -124,8 +145,11 @@ export function serializeGame(state: GameState): GameState & { mutationLabels: R
     board: state.board.map((cell) => (cell ? { ...cell } : null)),
     players: state.players.map((player) => ({ ...player, mutations: [...player.mutations], pendingMutations: [...player.pendingMutations] })),
     queuedActions: state.queuedActions.map((action) => ({ ...action })),
+    deadCells: state.deadCells.map((marker) => ({ ...marker })),
+    husks: state.husks.map((marker) => ({ ...marker })),
     log: [...state.log],
     mutationLabels,
+    mutationCatalog: MUTATION_CATALOG,
   };
 }
 
@@ -142,12 +166,14 @@ export function submitAction(state: GameState, action: QueuedAction): { ok: bool
   );
   if (existingQueuedIndex >= 0) state.queuedActions.splice(existingQueuedIndex, 1);
 
-  const queuedPlaces = state.queuedActions.filter((queued) => queued.playerId === player.id && queued.action === 'place').length;
   if (action.action === 'place') {
     if (!action.cellType) return { ok: false, message: 'Missing cell type.' };
-    if (queuedPlaces >= state.settings.placementsPerRound + player.energy) return { ok: false, message: 'No placement budget left.' };
+    const nextActions = [...state.queuedActions, action];
+    if (usedPlacementBudget(nextActions, player) > placementBudget(state, player, true)) return { ok: false, message: 'No placement budget left.' };
     if (cellAt(state, action.x, action.y)) return { ok: false, message: 'Target is occupied.' };
+    if (isBlockedByHusk(state, player, action.x, action.y)) return { ok: false, message: 'Seed husk blocks enemy placement this round.' };
     if (!isNearOwnedCell(state, player, action.x, action.y)) return { ok: false, message: 'Target is outside your placement range.' };
+    if (isBlockedBySaltLine(state, player, action.x, action.y)) return { ok: false, message: 'Salt Line blocks placement near enemy walls.' };
   }
 
   if (action.action === 'remove') {
@@ -166,7 +192,20 @@ export function chooseMutation(state: GameState, playerId: number, mutation: Mut
 
   player.mutations.push(mutation);
   player.pendingMutations = [];
+  if (mutation === 'extra_biomass') player.energy = clamp(player.energy + 1, 0, 8);
   pushLog(state, `${player.name} chose ${mutationLabels[mutation]}.`);
+  return { ok: true };
+}
+
+export function rerollMutations(state: GameState, playerId: number): { ok: boolean; message?: string } {
+  const player = state.players.find((candidate) => candidate.id === playerId);
+  if (!player) return { ok: false, message: 'Player not found.' };
+  if (!player.mutations.includes('reroll_gland') || player.rerolls <= 0) return { ok: false, message: 'No mutation reroll available.' };
+  if (player.pendingMutations.length === 0) return { ok: false, message: 'No mutation choices to reroll.' };
+
+  player.rerolls -= 1;
+  player.pendingMutations = drawMutations(player, mutationChoiceCount(player));
+  pushLog(state, `${player.name} rerolled mutation choices.`);
   return { ok: true };
 }
 
@@ -180,16 +219,21 @@ function tickGame(state: GameState): void {
 
 function resolveRound(state: GameState): void {
   queueBotActions(state);
+  applyWildTendrils(state);
+  recordRoundEconomy(state);
   applyQueuedRemovals(state);
-  resolveLife(state);
+  const deaths = resolveLife(state);
+  applyDeathEffects(state, deaths);
   applyQueuedPlacements(state);
   resolvePickups(state);
+  applyGrowthAftershocks(state, deaths);
   spawnPickups(state);
   updateAliveAndWinner(state);
 
   state.queuedActions = [];
   if (!state.winnerTeam) {
     state.round += 1;
+    prepareNextRound(state, deaths);
     state.phaseEndsAt = Date.now() + state.settings.planningSeconds * 1000;
     pushLog(state, `Round ${state.round} planning started.`);
     queueBotActions(state);
@@ -212,7 +256,7 @@ function queueBotActions(state: GameState): void {
     const alreadyQueued = state.queuedActions.some((action) => action.playerId === player.id);
     if (alreadyQueued) continue;
 
-    const budget = state.settings.placementsPerRound + player.energy;
+    const budget = placementBudget(state, player, true);
     const candidates = placementCandidates(state, player)
       .map(([x, y]) => ({ x, y, score: botScoreTile(state, player, x, y) }))
       .sort((a, b) => b.score - a.score)
@@ -275,6 +319,152 @@ function nearestCellDistance(state: GameState, x: number, y: number, predicate: 
   return nearest;
 }
 
+function placementBudget(state: GameState, player: Player, includeDebtCredit = false): number {
+  let budget = state.settings.placementsPerRound + player.energy + player.carryoverBudget + player.tempBudget - player.budgetDebt;
+  if (player.mutations.includes('extra_biomass')) budget += 1;
+  if (player.mutations.includes('thin_frontier')) budget -= 1;
+  if (player.mutations.includes('starved_colony')) budget -= 2;
+  if (player.mutations.includes('metabolic_crash') && state.round - player.lastFoodRound >= 3) budget -= 2;
+  if (player.mutations.includes('mutation_sickness')) {
+    const sicknessIndex = player.mutations.indexOf('mutation_sickness');
+    budget -= Math.max(0, player.mutations.length - sicknessIndex - 1);
+  }
+  if (player.mutations.includes('deadweight')) budget -= Math.min(3, livingCells(state, player.id, 'wall'));
+  if (player.mutations.includes('burst_turn')) budget = state.round % 4 === 0 ? budget * 2 : budget - 1;
+  if (player.mutations.includes('cellular_debt') && includeDebtCredit) budget += 3;
+  return Math.max(0, Math.floor(budget));
+}
+
+function usedPlacementBudget(actions: QueuedAction[], player: Player): number {
+  let used = 0;
+  let freeSeeds = 0;
+  for (const action of actions) {
+    if (action.playerId !== player.id || action.action !== 'place') continue;
+    used += actionPlacementCost(action, player, freeSeeds);
+    if (action.cellType === 'seed') freeSeeds += 1;
+  }
+  return used;
+}
+
+function actionPlacementCost(action: QueuedAction, player: Player, seedIndex: number): number {
+  if (action.cellType === 'seed' && player.mutations.includes('cheap_seeds') && seedIndex < 2) return 0;
+  if (action.cellType === 'hunter' && player.mutations.includes('expensive_hunters')) return 2;
+  if (action.cellType === 'wall' && player.mutations.includes('hollow_walls')) return 0;
+  return 1;
+}
+
+function livingCells(state: GameState, playerId: number, type?: CellType): number {
+  return state.board.filter((cell) => cell?.ownerId === playerId && (!type || cell.type === type)).length;
+}
+
+function recordRoundEconomy(state: GameState): void {
+  for (const player of state.players) {
+    if (!player.alive) continue;
+    const baseBudget = placementBudget(state, player, false);
+    const used = usedPlacementBudget(state.queuedActions, player);
+    player.carryoverBudget = player.mutations.includes('stored_calories') ? Math.min(3, Math.max(0, baseBudget - used)) : 0;
+    player.budgetDebt = player.mutations.includes('cellular_debt') ? Math.min(3, Math.max(0, used - baseBudget)) : 0;
+  }
+}
+
+function prepareNextRound(state: GameState, deaths: BoardMarker[]): void {
+  for (const player of state.players) {
+    const playerDeaths = deaths.filter((death) => death.ownerId === player.id).length;
+    player.tempBudget = player.mutations.includes('metabolic_refund') ? Math.min(3, playerDeaths) : 0;
+  }
+
+  state.deadCells = deaths;
+  state.husks = state.husks.filter((marker) => state.round - marker.round <= 1);
+}
+
+function applyWildTendrils(state: GameState): void {
+  for (const player of state.players) {
+    if (!player.alive || !player.mutations.includes('wild_tendrils')) continue;
+    const candidates = placementCandidates(state, player).filter(([x, y]) => !isBlockedBySaltLine(state, player, x, y));
+    const [x, y] = shuffle(candidates)[0] ?? [];
+    if (x === undefined || y === undefined) continue;
+    state.queuedActions.push({ playerId: player.id, action: 'place', x, y, cellType: 'seed' });
+  }
+}
+
+function applyDeathEffects(state: GameState, deaths: BoardMarker[]): void {
+  for (const death of deaths) {
+    const player = state.players[death.ownerId - 1];
+    if (death.type === 'seed' && player?.mutations.includes('seed_husks')) {
+      state.husks.push(death);
+    }
+    if (death.type === 'spore' && player?.mutations.includes('volatile_spores')) {
+      for (const [nx, ny] of neighbors(state, death.x, death.y)) {
+        const target = cellAt(state, nx, ny);
+        if (!target || (target.ownerId && state.players[target.ownerId - 1]?.team !== player.team)) {
+          setCell(state, nx, ny, { ownerId: player.id, type: 'seed' });
+          break;
+        }
+      }
+    }
+    if (death.type === 'spore' && player?.mutations.includes('pollen_trail')) {
+      state.deadCells.push(death);
+    }
+  }
+}
+
+function applyGrowthAftershocks(state: GameState, deaths: BoardMarker[]): void {
+  for (const player of state.players) {
+    if (!player.alive) continue;
+
+    if (player.mutations.includes('mold_problem')) {
+      const owned = ownedCellPositions(state, player.id);
+      const [x, y] = shuffle(owned)[0] ?? [];
+      if (x !== undefined && y !== undefined) {
+        const candidates = neighbors(state, x, y).filter(([nx, ny]) => !cellAt(state, nx, ny));
+        const [sx, sy] = shuffle(candidates)[0] ?? [];
+        if (sx !== undefined && sy !== undefined) setCell(state, sx, sy, { ownerId: player.id, type: 'spore' });
+      }
+    }
+
+    if (player.mutations.includes('cloud_bloom')) {
+      const spores = ownedCellPositions(state, player.id).filter(([x, y]) => cellAt(state, x, y)?.type === 'spore');
+      for (const [x, y] of spores.slice(0, 2)) {
+        const targets = twoStepCells(state, x, y).filter(([tx, ty]) => !cellAt(state, tx, ty));
+        const [tx, ty] = shuffle(targets)[0] ?? [];
+        if (tx !== undefined && ty !== undefined) setCell(state, tx, ty, { ownerId: player.id, type: 'spore' });
+      }
+    }
+  }
+
+  for (const death of deaths) {
+    for (const player of state.players) {
+      if (!player.mutations.includes('trophy_growth') || player.id === death.ownerId) continue;
+      const hunterNearby = neighbors(state, death.x, death.y).some(([nx, ny]) => {
+        const cell = cellAt(state, nx, ny);
+        return cell?.ownerId === player.id && cell.type === 'hunter';
+      });
+      if (hunterNearby) player.tempBudget = Math.min(3, player.tempBudget + 1);
+    }
+  }
+}
+
+function ownedCellPositions(state: GameState, playerId: number): Array<[number, number]> {
+  const positions: Array<[number, number]> = [];
+  forEachCell(state, (x, y, cell) => {
+    if (cell?.ownerId === playerId) positions.push([x, y]);
+  });
+  return positions;
+}
+
+function twoStepCells(state: GameState, x: number, y: number): Array<[number, number]> {
+  const result: Array<[number, number]> = [];
+  for (let dy = -2; dy <= 2; dy += 1) {
+    for (let dx = -2; dx <= 2; dx += 1) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) !== 2) continue;
+      const nx = x + dx;
+      const ny = y + dy;
+      if (inBounds(state, nx, ny)) result.push([nx, ny]);
+    }
+  }
+  return result;
+}
+
 function applyQueuedRemovals(state: GameState): void {
   for (const action of state.queuedActions) {
     if (action.action !== 'remove') continue;
@@ -301,6 +491,8 @@ function applyQueuedPlacements(state: GameState): void {
     const action = actions[0];
     const player = state.players.find((candidate) => candidate.id === action.playerId && candidate.alive);
     if (!player || !action.cellType || cellAt(state, action.x, action.y)) continue;
+    if (isBlockedByHusk(state, player, action.x, action.y)) continue;
+    if (isBlockedBySaltLine(state, player, action.x, action.y)) continue;
     setCell(state, action.x, action.y, { ownerId: player.id, type: action.cellType });
     placedByPlayer.set(player.id, (placedByPlayer.get(player.id) ?? 0) + 1);
   }
@@ -327,17 +519,27 @@ function resolvePickups(state: GameState): void {
     if (!player) return;
 
     if (cell.type === 'food') {
-      player.energy = clamp(player.energy + 1, 0, 5);
+      const gain = 1 + (player.mutations.includes('richer_food') ? 1 : 0);
+      player.energy = clamp(player.energy + gain, 0, 8);
+      player.lastFoodRound = state.round;
+      if (player.mutations.includes('spoiled_food')) killAdjacentOwnedCell(state, player.id, x, y);
       pushLog(state, `${player.name} consumed biomass and gained placement energy.`);
     } else if (player.pendingMutations.length === 0) {
-      player.pendingMutations = drawMutations(player, 3);
+      player.pendingMutations = drawMutations(player, mutationChoiceCount(player));
       pushLog(state, `${player.name} unlocked mutation choices.`);
     }
     setCell(state, x, y, null);
   });
 }
 
-function resolveLife(state: GameState): void {
+function killAdjacentOwnedCell(state: GameState, playerId: number, x: number, y: number): void {
+  const target = shuffle(neighbors(state, x, y)).find(([nx, ny]) => cellAt(state, nx, ny)?.ownerId === playerId);
+  if (!target) return;
+  setCell(state, target[0], target[1], null);
+}
+
+function resolveLife(state: GameState): BoardMarker[] {
+  const previous = state.board.map((cell) => (cell ? { ...cell } : null));
   const next = Array<Cell | null>(state.board.length).fill(null);
 
   for (let y = 0; y < state.settings.height; y += 1) {
@@ -353,14 +555,16 @@ function resolveLife(state: GameState): void {
 
       if (current?.ownerId) {
         const player = state.players[current.ownerId - 1];
-        const ownNeighbors = sameOwnerNeighbors(state, x, y, current.ownerId);
-        const enemyPressure = [...pressure.entries()]
-          .filter(([owner]) => owner !== current.ownerId)
-          .reduce((sum, [, value]) => sum + value, 0);
-        const defenseBonus = current.type === 'wall' && player?.mutations.includes('fortify') ? 1 : 0;
-        const sporeLives = current.type === 'spore' && player?.mutations.includes('fertile') && ownNeighbors >= 1;
+        const ownNeighbors = effectiveOwnNeighbors(state, x, y, current);
+        const enemyPressure = hostilePressureAgainst(state, x, y, current.ownerId);
+        const defenseBonus = survivalDefenseBonus(state, current, x, y);
+        const sporeLives =
+          current.type === 'spore' &&
+          ((player?.mutations.includes('fertile') && ownNeighbors >= 1) ||
+            (player?.mutations.includes('light_spores') && ownNeighbors >= 1 && enemyPressure === 0));
+        const brittleWallDies = current.type === 'wall' && player?.mutations.includes('brittle_walls') && enemyPressure > 0;
 
-        if ((sporeLives || ownNeighbors === 2 || ownNeighbors === 3) && enemyPressure <= 3 + defenseBonus) {
+        if (!brittleWallDies && (sporeLives || ownNeighbors === 2 || ownNeighbors === 3) && enemyPressure <= 3 + defenseBonus) {
           next[indexOf(state, x, y)] = current;
         } else if (strongest && strongest[0] !== current.ownerId && strongest[1] >= 4 + defenseBonus) {
           next[indexOf(state, x, y)] = { ownerId: strongest[0], type: 'seed' };
@@ -375,6 +579,7 @@ function resolveLife(state: GameState): void {
   }
 
   state.board = next;
+  return collectDeaths(state, previous, next);
 }
 
 function ownerPressure(state: GameState, x: number, y: number): Map<number, number> {
@@ -385,8 +590,10 @@ function ownerPressure(state: GameState, x: number, y: number): Map<number, numb
 
     const player = state.players[cell.ownerId - 1];
     let weight = 1;
-    if (cell.type === 'hunter') weight = player?.mutations.includes('predator') ? 3 : 2;
-    if (cell.type === 'wall') weight = 0.5;
+    if (cell.type === 'hunter') weight = hunterPressure(state, player, nx, ny);
+    if (cell.type === 'wall') weight = wallPressure(player);
+    if (cell.type === 'spore' && player?.mutations.includes('sterile_spores')) weight = 0;
+    if (cell.type === 'seed' && player?.mutations.includes('weed_patch')) weight = 1.35;
 
     pressure.set(cell.ownerId, (pressure.get(cell.ownerId) ?? 0) + weight);
   }
@@ -395,6 +602,97 @@ function ownerPressure(state: GameState, x: number, y: number): Map<number, numb
 
 function sameOwnerNeighbors(state: GameState, x: number, y: number, ownerId: number): number {
   return neighbors(state, x, y).filter(([nx, ny]) => cellAt(state, nx, ny)?.ownerId === ownerId).length;
+}
+
+function effectiveOwnNeighbors(state: GameState, x: number, y: number, cell: Cell): number {
+  let count = sameOwnerNeighbors(state, x, y, cell.ownerId as number);
+  const player = state.players[(cell.ownerId as number) - 1];
+  if (cell.type === 'wall' && player?.mutations.includes('thick_walls')) count += 1;
+  return count;
+}
+
+function survivalDefenseBonus(state: GameState, cell: Cell, x: number, y: number): number {
+  const player = state.players[(cell.ownerId as number) - 1];
+  if (!player) return 0;
+
+  let bonus = 0;
+  if (cell.type === 'wall' && player.mutations.includes('fortify')) bonus += 1;
+  if (cell.type === 'wall' && player.mutations.includes('hollow_walls')) bonus -= 1;
+  if (cell.type === 'seed' && player.mutations.includes('strong_seeds')) bonus += 1;
+  if (cell.type === 'seed' && player.mutations.includes('weak_seeds')) bonus -= 1;
+  if (cell.type === 'seed' && player.mutations.includes('weed_patch')) bonus -= 1;
+  if (cell.type === 'hunter' && player.mutations.includes('coward_hunters') && hostileNeighborCount(state, x, y, player.team) > 1) bonus -= 1;
+  return bonus;
+}
+
+function hostilePressureAgainst(state: GameState, x: number, y: number, ownerId: number): number {
+  const owner = state.players[ownerId - 1];
+  let pressure = 0;
+
+  for (const [nx, ny] of neighbors(state, x, y)) {
+    const cell = cellAt(state, nx, ny);
+    if (!cell?.ownerId) continue;
+
+    const player = state.players[cell.ownerId - 1];
+    const sameOwner = cell.ownerId === ownerId;
+    const sameTeam = player?.team === owner?.team;
+    const friendlyFire = sameOwner && cell.type === 'hunter' && player?.mutations.includes('friendly_fire');
+    const rabid = sameOwner && cell.type === 'hunter' && player?.mutations.includes('rabid_hunters');
+
+    if (!sameTeam || friendlyFire || rabid) {
+      pressure += cell.type === 'hunter' ? hunterPressure(state, player, nx, ny) : player?.mutations.includes('thorn_walls') && cell.type === 'wall' ? 1.25 : 1;
+    }
+  }
+
+  return pressure;
+}
+
+function hunterPressure(state: GameState, player: Player | undefined, x: number, y: number): number {
+  if (!player) return 2;
+  let pressure = player.mutations.includes('predator') ? 3 : 2;
+  if (player.mutations.includes('sharp_hunters')) pressure += 0.5;
+  if (player.mutations.includes('rabid_hunters')) pressure += 1;
+  if (player.mutations.includes('coward_hunters') && hostileNeighborCount(state, x, y, player.team) > 1) pressure = 1;
+  if (player.mutations.includes('pack_hunting')) {
+    pressure += neighbors(state, x, y).filter(([nx, ny]) => {
+      const neighbor = cellAt(state, nx, ny);
+      return neighbor?.ownerId === player.id && neighbor.type === 'hunter';
+    }).length * 0.75;
+  }
+  return pressure;
+}
+
+function wallPressure(player: Player | undefined): number {
+  if (!player) return 0.5;
+  if (player.mutations.includes('thorn_walls')) return 1.5;
+  if (player.mutations.includes('hollow_walls')) return 0.25;
+  return 0.5;
+}
+
+function hostileNeighborCount(state: GameState, x: number, y: number, team: number): number {
+  return neighbors(state, x, y).filter(([nx, ny]) => {
+    const cell = cellAt(state, nx, ny);
+    return Boolean(cell?.ownerId && state.players[cell.ownerId - 1]?.team !== team);
+  }).length;
+}
+
+function collectDeaths(state: GameState, previous: Array<Cell | null>, next: Array<Cell | null>): BoardMarker[] {
+  const deaths: BoardMarker[] = [];
+  for (let index = 0; index < previous.length; index += 1) {
+    const before = previous[index];
+    const after = next[index];
+    if (!before?.ownerId) continue;
+    if (!after || after.ownerId !== before.ownerId) {
+      deaths.push({
+        x: index % state.settings.width,
+        y: Math.floor(index / state.settings.width),
+        ownerId: before.ownerId,
+        type: before.type as CellType,
+        round: state.round,
+      });
+    }
+  }
+  return deaths;
 }
 
 function seedArena(state: GameState): void {
@@ -468,17 +766,65 @@ function updateAliveAndWinner(state: GameState): void {
 
 function drawMutations(player: Player, count: number): MutationId[] {
   const available = mutationPool.filter((mutation) => !player.mutations.includes(mutation));
-  return shuffle(available).slice(0, count);
+  const choices = shuffle(available).slice(0, count);
+  if (player.mutations.includes('bad_choices') && !choices.some((mutation) => mutationDefinition(mutation)?.rarity === 'cursed')) {
+    const cursed = shuffle(available.filter((mutation) => mutationDefinition(mutation)?.rarity === 'cursed'))[0];
+    if (cursed) choices[choices.length - 1] = cursed;
+  }
+  return choices;
 }
 
 function isNearOwnedCell(state: GameState, player: Player, x: number, y: number): boolean {
-  const range = state.settings.placementRange + (player.mutations.includes('overgrowth') ? 1 : 0);
-  for (let cy = y - range; cy <= y + range; cy += 1) {
-    for (let cx = x - range; cx <= x + range; cx += 1) {
-      if (inBounds(state, cx, cy) && cellAt(state, cx, cy)?.ownerId === player.id) return true;
+  const maxRange = placementRangeForPlayer(state, player) + (player.mutations.includes('long_roots') ? 1 : 0);
+  for (let cy = y - maxRange; cy <= y + maxRange; cy += 1) {
+    for (let cx = x - maxRange; cx <= x + maxRange; cx += 1) {
+      if (!inBounds(state, cx, cy)) continue;
+      const source = cellAt(state, cx, cy);
+      if (source?.ownerId !== player.id) continue;
+      const sourceRange = placementRangeForPlayer(state, player) + (player.mutations.includes('long_roots') && source.type === 'seed' ? 1 : 0);
+      if (Math.abs(cx - x) <= sourceRange && Math.abs(cy - y) <= sourceRange) return true;
     }
   }
+  if (player.mutations.includes('territorial_memory') || player.mutations.includes('pollen_trail')) {
+    const range = placementRangeForPlayer(state, player);
+    return state.deadCells.some((marker) => marker.ownerId === player.id && state.round - marker.round <= 1 && Math.abs(marker.x - x) <= range && Math.abs(marker.y - y) <= range);
+  }
   return false;
+}
+
+function placementRangeForPlayer(state: GameState, player: Player): number {
+  let range = state.settings.placementRange;
+  if (player.mutations.includes('overgrowth')) range += 1;
+  if (player.mutations.includes('thin_frontier')) range += 2;
+  if (player.mutations.includes('blind_expansion')) range += 3;
+  if (player.mutations.includes('local_only')) range -= 1;
+  if (player.mutations.includes('one_step_colony')) range = 1;
+  return Math.max(1, range);
+}
+
+function isBlockedBySaltLine(state: GameState, player: Player, x: number, y: number): boolean {
+  return neighbors(state, x, y).some(([nx, ny]) => {
+    const cell = cellAt(state, nx, ny);
+    if (cell?.type !== 'wall' || !cell.ownerId) return false;
+    const wallOwner = state.players[cell.ownerId - 1];
+    if (wallOwner?.team === player.team) return false;
+    return player.mutations.includes('salt_line') || wallOwner?.mutations.includes('salt_line');
+  });
+}
+
+function isBlockedByHusk(state: GameState, player: Player, x: number, y: number): boolean {
+  return state.husks.some((husk) => {
+    const owner = state.players[husk.ownerId - 1];
+    return husk.x === x && husk.y === y && state.round - husk.round <= 1 && owner?.team !== player.team;
+  });
+}
+
+function mutationChoiceCount(player: Player): number {
+  return 3 + (player.mutations.includes('extra_choice') ? 1 : 0);
+}
+
+function mutationDefinition(id: MutationId) {
+  return MUTATION_CATALOG.find((mutation) => mutation.id === id);
 }
 
 function neighbors(state: GameState, x: number, y: number): Array<[number, number]> {

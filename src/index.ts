@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
-import { chooseMutation, createGame, forceResolve, GameSettings, QueuedAction, serializeGame, submitAction } from './game';
+import { chooseMutation, createGame, forceResolve, GameSettings, QueuedAction, rerollMutations, serializeGame, submitAction } from './game';
 
 const app = express();
 // Keep this 3000 for internal Docker use; 
@@ -39,6 +39,15 @@ app.post('/api/actions', (req: Request<unknown, unknown, QueuedAction>, res: Res
 
 app.post('/api/mutations', (req: Request<unknown, unknown, { playerId: number; mutation: string }>, res: Response) => {
   const result = chooseMutation(game, req.body.playerId, req.body.mutation as never);
+  if (!result.ok) {
+    res.status(400).json(result);
+    return;
+  }
+  res.json(serializeGame(game));
+});
+
+app.post('/api/mutations/reroll', (req: Request<unknown, unknown, { playerId: number }>, res: Response) => {
+  const result = rerollMutations(game, req.body.playerId);
   if (!result.ok) {
     res.status(400).json(result);
     return;
